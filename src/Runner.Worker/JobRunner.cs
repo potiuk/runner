@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using System.Net.Http;
 using GitHub.Runner.Common;
 using GitHub.Runner.Sdk;
+using GitHub.DistributedTask.Pipelines.ContextData;
 
 namespace GitHub.Runner.Worker
 {
@@ -63,6 +64,14 @@ namespace GitHub.Runner.Worker
                 jobContext.InitializeJob(message, jobRequestCancellationToken);
                 Trace.Info("Starting the job execution context.");
                 jobContext.Start();
+                var githubContext = jobContext.ExpressionValues["github"] as GitHubContext;
+
+                if (!JobPassesSecurityRestrictions(jobContext))
+                {
+                    jobContext.Error("Running job on this worker disallowed by security policy");
+                    return await CompleteJobAsync(jobServer, jobContext, message, TaskResult.Failed);
+                }
+
                 jobContext.Debug($"Starting: {message.JobDisplayName}");
 
                 runnerShutdownRegistration = HostContext.RunnerShutdownToken.Register(() =>
@@ -186,6 +195,81 @@ namespace GitHub.Runner.Worker
                 }
 
                 await ShutdownQueue(throwOnFailure: false);
+            }
+        }
+
+        private bool JobPassesSecurityRestrictions(IExecutionContext jobContext)
+        {
+            var gitHubContext = jobContext.ExpressionValues["github"] as GitHubContext;
+
+            try {
+              if (gitHubContext.IsPullRequest())
+              {
+                  return OkayToRunPullRequest(gitHubContext);
+              }
+
+              return true;
+            }
+            catch (Exception ex)
+            {
+                Trace.Error("Caught exception in JobPassesSecurityRestrictions");
+                Trace.Error("As a safety precaution we are not allowing this job to run");
+                Trace.Error(ex);
+                return false;
+            }
+        }
+
+        private bool OkayToRunPullRequest(GitHubContext gitHubContext)
+        {
+            var configStore = HostContext.GetService<IConfigurationStore>();
+            var settings = configStore.GetSettings();
+            var prSecuritySettings = settings.PullRequestSecuritySettings;
+
+            if (prSecuritySettings is null) {
+                Trace.Info("No pullRequestSecurity defined in settings, allowing this build");
+                return true;
+            }
+
+            var githubEvent = gitHubContext["event"] as DictionaryContextData;
+            var prData = githubEvent["pull_request"] as DictionaryContextData;
+
+            var authorAssociation = prData.TryGetValue("author_association", out var value)
+              ? value as StringContextData : null;
+
+
+            // TODO: Allow COLLABORATOR, MEMBER too -- possibly by a config setting
+            if (authorAssociation == "OWNER")
+            {
+                Trace.Info("PR is from the repo owner, always allowed");
+                return true;
+            }
+            else if (prSecuritySettings.AllowContributors && authorAssociation == "COLLABORATOR") {
+                Trace.Info("PR is from the repo collaborator, allowing");
+                return true;
+            }
+
+            var prHead = prData["head"] as DictionaryContextData;
+            var prUser = prHead["user"] as DictionaryContextData;
+            var prUserLogin = prUser["login"] as StringContextData;
+
+            Trace.Info($"GitHub PR author is {prUserLogin as StringContextData}");
+
+            if (prUserLogin == null)
+            {
+                Trace.Info("Unable to get PR author, not allowing PR to run");
+                return false;
+            }
+
+            if (prSecuritySettings.AllowedAuthors.Contains(prUserLogin))
+            {
+                Trace.Info("Author in PR allowed list");
+                return true;
+            }
+            else
+            {
+                Trace.Info($"Not running job as author ({prUserLogin}) is not in {{{string.Join(", ", prSecuritySettings.AllowedAuthors)}}}");
+
+                return false;
             }
         }
 
